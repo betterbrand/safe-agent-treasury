@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.safe-treasury.refill</string>
+    <key>Comment</key>
+    <string>Safe wallet auto-refill — pulls MOR/ETH from Safe to hot wallet</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__NODE_PATH__</string>
+        <string>__REFILL_SCRIPT_PATH__</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>__SAFE_DIR__</string>
+    <key>StartInterval</key>
+    <integer>21600</integer>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>__SAFE_DIR__/data/logs/refill.log</string>
+    <key>StandardErrorPath</key>
+    <string>__SAFE_DIR__/data/logs/refill.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>

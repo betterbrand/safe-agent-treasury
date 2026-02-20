@@ -26,7 +26,7 @@
  *   SAFE_RPC=https://...          Base RPC URL
  */
 
-import { readFileSync } from "node:fs";
+import { readFileSync, openSync, closeSync, unlinkSync, constants } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { parseArgs } from "node:util";
 import {
@@ -53,6 +53,41 @@ import { privateKeyToAccount } from "viem/accounts";
 
 // --- Load .env ---
 const SAFE_DIR = process.env.SAFE_DIR || process.env.MORPHEUS_DIR || `${process.env.HOME}/morpheus`;
+
+// --- File locking to prevent concurrent execution ---
+const LOCK_FILE = `${SAFE_DIR}/.configure.lock`;
+
+function acquireLock() {
+  try {
+    // O_EXCL fails if file exists - atomic check-and-create
+    const fd = openSync(LOCK_FILE, constants.O_CREAT | constants.O_EXCL | constants.O_RDWR);
+    closeSync(fd);
+    return true;
+  } catch (e) {
+    if (e.code === "EEXIST") {
+      console.error(`[ERROR] Another configure instance is running (lock file exists: ${LOCK_FILE})`);
+      console.error("  If no other instance is running, delete the lock file manually.");
+      process.exit(1);
+    }
+    throw e;
+  }
+}
+
+function releaseLock() {
+  try {
+    unlinkSync(LOCK_FILE);
+  } catch {
+    // Ignore - lock file may already be removed
+  }
+}
+
+// Acquire lock immediately on startup
+acquireLock();
+
+// Release lock on exit (normal or error)
+process.on("exit", releaseLock);
+process.on("SIGINT", () => { releaseLock(); process.exit(130); });
+process.on("SIGTERM", () => { releaseLock(); process.exit(143); });
 
 function loadEnv(filepath) {
   try {
@@ -93,8 +128,14 @@ const { values: args } = parseArgs({
 
 // --- Configuration ---
 const SAFE_ADDRESS = process.env.SAFE_ADDRESS;
-const RPC_URL =
-  process.env.SAFE_RPC || process.env.EVERCLAW_RPC || "https://base-mainnet.public.blastapi.io";
+// SECURITY: Require explicit RPC config. Public RPCs can return manipulated data.
+const RPC_URL = process.env.SAFE_RPC || process.env.EVERCLAW_RPC;
+if (!RPC_URL) {
+  console.error("[ERROR] SAFE_RPC not configured in ~/morpheus/.env");
+  console.error("  Public RPCs are NOT secure for financial operations.");
+  console.error("  Use Alchemy, Infura, QuickNode, or your own node.");
+  process.exit(1);
+}
 
 const KEYCHAIN_ACCOUNT =
   process.env.SAFE_KEYCHAIN_ACCOUNT || process.env.EVERCLAW_KEYCHAIN_ACCOUNT || "everclaw-agent";
@@ -103,9 +144,7 @@ const KEYCHAIN_SERVICE =
 const KEYCHAIN_DB =
   process.env.SAFE_KEYCHAIN_DB || process.env.EVERCLAW_KEYCHAIN_DB ||
   `${process.env.HOME}/Library/Keychains/everclaw.keychain-db`;
-const KEYCHAIN_PASS_FILE =
-  process.env.SAFE_KEYCHAIN_PASS_FILE || process.env.EVERCLAW_KEYCHAIN_PASS_FILE ||
-  `${process.env.HOME}/.everclaw-keychain-pass`;
+// KEYCHAIN_PASS_FILE removed - auto-unlock via CLI args exposed password in `ps aux`
 
 // Contract addresses (Base mainnet)
 const MOR_TOKEN = "0x7431aDa8a591C955a994a21710752EF9b882b8e3";
@@ -121,6 +160,23 @@ const ETH_DAILY_ALLOWANCE = parseEther(
   args["eth-allowance"] || process.env.ETH_DAILY_ALLOWANCE || "0.05"
 );
 const RESET_MINUTES = parseInt(args["reset-minutes"], 10); // 1440 = 24 hours
+
+// SECURITY: Validate bounds for uint96 (allowance amounts) and uint16 (reset minutes)
+const UINT96_MAX = 2n ** 96n - 1n;
+const UINT16_MAX = 65535;
+
+if (MOR_DAILY_ALLOWANCE > UINT96_MAX) {
+  console.error(`[ERROR] MOR allowance exceeds uint96 max (${formatEther(UINT96_MAX)})`);
+  process.exit(1);
+}
+if (ETH_DAILY_ALLOWANCE > UINT96_MAX) {
+  console.error(`[ERROR] ETH allowance exceeds uint96 max (${formatEther(UINT96_MAX)})`);
+  process.exit(1);
+}
+if (Number.isNaN(RESET_MINUTES) || RESET_MINUTES < 1 || RESET_MINUTES > UINT16_MAX) {
+  console.error(`[ERROR] --reset-minutes must be between 1 and ${UINT16_MAX}`);
+  process.exit(1);
+}
 
 // --- ABIs ---
 const SAFE_ABI = parseAbi([
@@ -153,16 +209,9 @@ function log(msg) {
 }
 
 function getPrivateKey() {
-  // Try to unlock keychain via password file (optional -- keychain may already be unlocked)
-  try {
-    const pass = readFileSync(KEYCHAIN_PASS_FILE, "utf-8").trim();
-    execFileSync("security", ["unlock-keychain", "-p", pass, KEYCHAIN_DB], {
-      stdio: "pipe",
-    });
-  } catch {
-    // Password file missing or unlock failed -- keychain may already be unlocked
-  }
-
+  // SECURITY: Keychain must be pre-unlocked. We no longer auto-unlock via password file
+  // because passing passwords via command-line args exposes them in `ps aux` output.
+  // Before running: security unlock-keychain ~/Library/Keychains/everclaw.keychain-db
   try {
     return execFileSync(
       "security",
@@ -178,7 +227,7 @@ function getPrivateKey() {
     log(`ERROR: Could not retrieve wallet key from Keychain.`);
     log(`  Account: ${KEYCHAIN_ACCOUNT}, Service: ${KEYCHAIN_SERVICE}`);
     log(`  DB: ${KEYCHAIN_DB}`);
-    log(`  Is the keychain unlocked? Run: security unlock-keychain ${KEYCHAIN_DB}`);
+    log(`  Unlock keychain first: security unlock-keychain "${KEYCHAIN_DB}"`);
     process.exit(1);
   }
 }
@@ -244,8 +293,19 @@ async function execSafeTx(
   });
 
   // Adjust v value for eth_sign (Safe expects v + 4)
+  // Normalize v to 27/28 first if it's in recovery id format (0/1)
   const sigBytes = toBytes(signature);
-  sigBytes[64] += 4;
+  let v = sigBytes[64];
+  if (v < 27) {
+    v += 27; // Normalize 0/1 -> 27/28
+  }
+  sigBytes[64] = v + 4; // Add 4 for eth_sign style -> 31/32
+
+  // Sanity check: v should now be 31 or 32
+  if (sigBytes[64] !== 31 && sigBytes[64] !== 32) {
+    throw new Error(`Unexpected signature v value: ${sigBytes[64]}`);
+  }
+
   const adjustedSig = toHex(sigBytes);
 
   // Execute

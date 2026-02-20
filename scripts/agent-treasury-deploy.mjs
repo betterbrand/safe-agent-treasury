@@ -81,8 +81,14 @@ const { values: args } = parseArgs({
 });
 
 // --- Configuration ---
-const RPC_URL =
-  process.env.SAFE_RPC || process.env.EVERCLAW_RPC || "https://base-mainnet.public.blastapi.io";
+// SECURITY: Require explicit RPC config. Public RPCs can return manipulated data.
+const RPC_URL = process.env.SAFE_RPC || process.env.EVERCLAW_RPC;
+if (!RPC_URL) {
+  console.error("[ERROR] SAFE_RPC not configured in ~/morpheus/.env");
+  console.error("  Public RPCs are NOT secure for financial operations.");
+  console.error("  Use Alchemy, Infura, QuickNode, or your own node.");
+  process.exit(1);
+}
 
 const KEYCHAIN_ACCOUNT =
   process.env.SAFE_KEYCHAIN_ACCOUNT || process.env.EVERCLAW_KEYCHAIN_ACCOUNT || "everclaw-agent";
@@ -91,9 +97,7 @@ const KEYCHAIN_SERVICE =
 const KEYCHAIN_DB =
   process.env.SAFE_KEYCHAIN_DB || process.env.EVERCLAW_KEYCHAIN_DB ||
   `${process.env.HOME}/Library/Keychains/everclaw.keychain-db`;
-const KEYCHAIN_PASS_FILE =
-  process.env.SAFE_KEYCHAIN_PASS_FILE || process.env.EVERCLAW_KEYCHAIN_PASS_FILE ||
-  `${process.env.HOME}/.everclaw-keychain-pass`;
+// KEYCHAIN_PASS_FILE removed - auto-unlock via CLI args exposed password in `ps aux`
 
 // Safe v1.4.1 canonical addresses on Base (8453)
 const SAFE_PROXY_FACTORY = "0x4e1DCf7AD4e460CfD30791CCC4F9c8a4f820ec67";
@@ -119,16 +123,9 @@ function log(msg) {
 }
 
 function getPrivateKey() {
-  // Try to unlock keychain via password file (optional -- keychain may already be unlocked)
-  try {
-    const pass = readFileSync(KEYCHAIN_PASS_FILE, "utf-8").trim();
-    execFileSync("security", ["unlock-keychain", "-p", pass, KEYCHAIN_DB], {
-      stdio: "pipe",
-    });
-  } catch {
-    // Password file missing or unlock failed -- keychain may already be unlocked
-  }
-
+  // SECURITY: Keychain must be pre-unlocked. We no longer auto-unlock via password file
+  // because passing passwords via command-line args exposes them in `ps aux` output.
+  // Before running: security unlock-keychain ~/Library/Keychains/everclaw.keychain-db
   try {
     return execFileSync(
       "security",
@@ -144,7 +141,7 @@ function getPrivateKey() {
     log(`ERROR: Could not retrieve wallet key from Keychain.`);
     log(`  Account: ${KEYCHAIN_ACCOUNT}, Service: ${KEYCHAIN_SERVICE}`);
     log(`  DB: ${KEYCHAIN_DB}`);
-    log(`  Is the keychain unlocked? Run: security unlock-keychain ${KEYCHAIN_DB}`);
+    log(`  Unlock keychain first: security unlock-keychain "${KEYCHAIN_DB}"`);
     process.exit(1);
   }
 }
@@ -210,8 +207,8 @@ async function main() {
   log(`Owner 2 (Agent): ${agentAddress}`);
   log(`Threshold: ${threshold}-of-${owners.length}`);
 
-  if (threshold < 1 || threshold > owners.length) {
-    log(`ERROR: Threshold must be between 1 and ${owners.length}`);
+  if (Number.isNaN(threshold) || threshold < 1 || threshold > owners.length) {
+    log(`ERROR: Threshold must be a number between 1 and ${owners.length}`);
     process.exit(1);
   }
 

@@ -38,8 +38,25 @@ fi
 echo "[2/3] Installing agent-treasury-refill.mjs..."
 mkdir -p "$SAFE_DIR/data/logs"
 
+# SECURITY: Set restrictive permissions on all directories and files
+chmod 700 "$SAFE_DIR"
+chmod 700 "$SAFE_DIR/data"
+chmod 700 "$SAFE_DIR/data/logs"
+
 cp "$SCRIPT_DIR/agent-treasury-refill.mjs" "$SAFE_DIR/agent-treasury-refill.mjs"
-echo "   Copied agent-treasury-refill.mjs -> $SAFE_DIR/"
+chmod 700 "$SAFE_DIR/agent-treasury-refill.mjs"
+
+# Secure .env if it exists (contains SAFE_ADDRESS, RPC credentials)
+if [[ -f "$SAFE_DIR/.env" ]]; then
+  chmod 600 "$SAFE_DIR/.env"
+fi
+
+# Secure existing log files
+if [[ -f "$SAFE_DIR/data/logs/refill.log" ]]; then
+  chmod 600 "$SAFE_DIR/data/logs/refill.log"
+fi
+
+echo "   Copied agent-treasury-refill.mjs -> $SAFE_DIR/ (mode 700)"
 
 # --- 3. Install launchd plist (macOS only) ---
 if [[ "$(uname)" == "Darwin" ]]; then
@@ -56,7 +73,10 @@ if [[ "$(uname)" == "Darwin" ]]; then
     -e "s|__SAFE_DIR__|$SAFE_DIR|g" \
     -e "s|__HOME__|$HOME|g" \
     "$SKILL_DIR/templates/com.safe-agent-treasury.refill.plist" > "$LAUNCH_AGENTS/com.safe-agent-treasury.refill.plist"
-  echo "   Installed com.safe-agent-treasury.refill.plist"
+
+  # SECURITY: Restrict plist permissions (contains paths, not secrets, but good hygiene)
+  chmod 644 "$LAUNCH_AGENTS/com.safe-agent-treasury.refill.plist"
+  echo "   Installed com.safe-agent-treasury.refill.plist (mode 644)"
 
   # Load service
   launchctl load "$LAUNCH_AGENTS/com.safe-agent-treasury.refill.plist" 2>/dev/null

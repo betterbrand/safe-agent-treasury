@@ -10,6 +10,7 @@
  *
  * Required in ~/morpheus/.env:
  *   SAFE_ADDRESS=0x...            Safe wallet address on Base
+ *   SAFE_RPC=https://...          Base RPC URL (required - no public RPC fallback)
  *
  * Optional in ~/morpheus/.env:
  *   ALLOWANCE_MODULE=0x...        AllowanceModule address (default: Base deployment)
@@ -17,10 +18,10 @@
  *   MOR_REFILL_AMOUNT=30          MOR to pull per refill
  *   ETH_LOW_THRESHOLD=0.01        ETH balance that triggers refill
  *   ETH_REFILL_AMOUNT=0.03        ETH to pull per refill
- *   SAFE_RPC=https://...          Base RPC URL
+ *   ALERT_WEBHOOK_URL=https://... Webhook URL for failure alerts (Slack, Discord, etc.)
  */
 
-import { readFileSync } from "node:fs";
+import { readFileSync, openSync, closeSync, unlinkSync, constants } from "node:fs";
 import { execFileSync } from "node:child_process";
 import {
   createPublicClient,
@@ -36,6 +37,40 @@ import { privateKeyToAccount } from "viem/accounts";
 
 // --- Load .env ---
 const SAFE_DIR = process.env.SAFE_DIR || process.env.MORPHEUS_DIR || `${process.env.HOME}/morpheus`;
+
+// --- File locking to prevent concurrent execution ---
+const LOCK_FILE = `${SAFE_DIR}/.refill.lock`;
+
+function acquireLock() {
+  try {
+    // O_EXCL fails if file exists - atomic check-and-create
+    const fd = openSync(LOCK_FILE, constants.O_CREAT | constants.O_EXCL | constants.O_RDWR);
+    closeSync(fd);
+    return true;
+  } catch (e) {
+    if (e.code === "EEXIST") {
+      console.error(`[${new Date().toISOString()}] ERROR: Another refill instance is running (lock file exists: ${LOCK_FILE})`);
+      process.exit(0); // Exit cleanly - not an error, just concurrent run
+    }
+    throw e;
+  }
+}
+
+function releaseLock() {
+  try {
+    unlinkSync(LOCK_FILE);
+  } catch {
+    // Ignore - lock file may already be removed
+  }
+}
+
+// Acquire lock immediately on startup
+acquireLock();
+
+// Release lock on exit (normal or error)
+process.on("exit", releaseLock);
+process.on("SIGINT", () => { releaseLock(); process.exit(130); });
+process.on("SIGTERM", () => { releaseLock(); process.exit(143); });
 
 function loadEnv(filepath) {
   try {
@@ -66,8 +101,14 @@ loadEnv(`${SAFE_DIR}/.env`);
 
 // --- Configuration ---
 const SAFE_ADDRESS = process.env.SAFE_ADDRESS;
-const RPC_URL =
-  process.env.SAFE_RPC || process.env.EVERCLAW_RPC || "https://base-mainnet.public.blastapi.io";
+// SECURITY: Require explicit RPC config. Public RPCs can return manipulated data.
+const RPC_URL = process.env.SAFE_RPC || process.env.EVERCLAW_RPC;
+if (!RPC_URL) {
+  console.error("[ERROR] SAFE_RPC not configured in ~/morpheus/.env");
+  console.error("  Public RPCs are NOT secure for financial operations.");
+  console.error("  Use Alchemy, Infura, QuickNode, or your own node.");
+  process.exit(1);
+}
 
 const KEYCHAIN_ACCOUNT =
   process.env.SAFE_KEYCHAIN_ACCOUNT || process.env.EVERCLAW_KEYCHAIN_ACCOUNT || "everclaw-agent";
@@ -76,9 +117,7 @@ const KEYCHAIN_SERVICE =
 const KEYCHAIN_DB =
   process.env.SAFE_KEYCHAIN_DB || process.env.EVERCLAW_KEYCHAIN_DB ||
   `${process.env.HOME}/Library/Keychains/everclaw.keychain-db`;
-const KEYCHAIN_PASS_FILE =
-  process.env.SAFE_KEYCHAIN_PASS_FILE || process.env.EVERCLAW_KEYCHAIN_PASS_FILE ||
-  `${process.env.HOME}/.everclaw-keychain-pass`;
+// KEYCHAIN_PASS_FILE removed - auto-unlock via CLI args exposed password in `ps aux`
 
 // Thresholds (configurable via .env)
 const MOR_LOW_THRESHOLD = parseEther(process.env.MOR_LOW_THRESHOLD || "20");
@@ -102,22 +141,76 @@ const ALLOWANCE_MODULE_ABI = parseAbi([
   "function getTokenAllowance(address safe, address delegate, address token) view returns (uint256[5])",
 ]);
 
+// Alerting (optional - set ALERT_WEBHOOK_URL for Slack/Discord notifications)
+const ALERT_WEBHOOK_URL = process.env.ALERT_WEBHOOK_URL;
+
 // --- Helpers ---
 function log(msg) {
   console.log(`[${new Date().toISOString()}] ${msg}`);
 }
 
-function getPrivateKey() {
-  // Try to unlock keychain via password file (optional -- keychain may already be unlocked)
-  try {
-    const pass = readFileSync(KEYCHAIN_PASS_FILE, "utf-8").trim();
-    execFileSync("security", ["unlock-keychain", "-p", pass, KEYCHAIN_DB], {
-      stdio: "pipe",
-    });
-  } catch {
-    // Password file missing or unlock failed -- keychain may already be unlocked
-  }
+/**
+ * Send alert to webhook (Slack, Discord, etc.) for critical failures.
+ * Non-blocking - failure to send alert doesn't stop script.
+ */
+async function sendAlert(message, severity = "error") {
+  if (!ALERT_WEBHOOK_URL) return;
 
+  const payload = {
+    text: `[safe-agent-treasury] [${severity.toUpperCase()}] ${message}`,
+    timestamp: new Date().toISOString(),
+    severity,
+  };
+
+  try {
+    const response = await fetch(ALERT_WEBHOOK_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (!response.ok) {
+      log(`Alert webhook returned ${response.status}`);
+    }
+  } catch (e) {
+    log(`Failed to send alert: ${e.message}`);
+  }
+}
+
+/**
+ * Retry wrapper for RPC operations.
+ * Retries on transient network failures with exponential backoff.
+ */
+async function withRetry(fn, { maxRetries = 3, baseDelayMs = 1000, description = "RPC call" } = {}) {
+  let lastError;
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (error) {
+      lastError = error;
+      const isTransient =
+        error.message?.includes("fetch") ||
+        error.message?.includes("network") ||
+        error.message?.includes("timeout") ||
+        error.message?.includes("ECONNREFUSED") ||
+        error.message?.includes("ETIMEDOUT") ||
+        error.code === "ECONNRESET";
+
+      if (!isTransient || attempt === maxRetries) {
+        throw error;
+      }
+
+      const delayMs = baseDelayMs * Math.pow(2, attempt - 1);
+      log(`  ${description} failed (attempt ${attempt}/${maxRetries}): ${error.message}. Retrying in ${delayMs}ms...`);
+      await new Promise(r => setTimeout(r, delayMs));
+    }
+  }
+  throw lastError;
+}
+
+function getPrivateKey() {
+  // SECURITY: Keychain must be pre-unlocked. We no longer auto-unlock via password file
+  // because passing passwords via command-line args exposes them in `ps aux` output.
+  // Before running: security unlock-keychain ~/Library/Keychains/everclaw.keychain-db
   try {
     return execFileSync(
       "security",
@@ -132,7 +225,7 @@ function getPrivateKey() {
   } catch (e) {
     log(`ERROR: Could not retrieve wallet key from Keychain.`);
     log(`  Account: ${KEYCHAIN_ACCOUNT}, Service: ${KEYCHAIN_SERVICE}`);
-    log(`  Is the keychain unlocked? Run: security unlock-keychain ${KEYCHAIN_DB}`);
+    log(`  Unlock keychain first: security unlock-keychain "${KEYCHAIN_DB}"`);
     process.exit(1);
   }
 }
@@ -166,14 +259,20 @@ async function main() {
     transport: http(RPC_URL),
   });
 
-  // Check balances
-  const morBalance = await publicClient.readContract({
-    address: MOR_TOKEN,
-    abi: ERC20_ABI,
-    functionName: "balanceOf",
-    args: [hotWallet],
-  });
-  const ethBalance = await publicClient.getBalance({ address: hotWallet });
+  // Check balances (with retry for transient RPC failures)
+  const morBalance = await withRetry(
+    () => publicClient.readContract({
+      address: MOR_TOKEN,
+      abi: ERC20_ABI,
+      functionName: "balanceOf",
+      args: [hotWallet],
+    }),
+    { description: "MOR balance check" }
+  );
+  const ethBalance = await withRetry(
+    () => publicClient.getBalance({ address: hotWallet }),
+    { description: "ETH balance check" }
+  );
 
   log(`MOR balance: ${formatEther(morBalance)}`);
   log(`ETH balance: ${formatEther(ethBalance)}`);
@@ -183,27 +282,65 @@ async function main() {
     log(
       `MOR below ${formatEther(MOR_LOW_THRESHOLD)} threshold. Pulling ${formatEther(MOR_REFILL_AMOUNT)} from Safe...`
     );
+
+    const morRefillArgs = [
+      SAFE_ADDRESS,      // safe
+      MOR_TOKEN,         // token
+      hotWallet,         // to
+      MOR_REFILL_AMOUNT, // amount (uint96)
+      zeroAddress,       // paymentToken (no gas payment)
+      0n,                // payment
+      hotWallet,         // delegate (msg.sender == delegate, no sig needed)
+      "0x",              // signature (empty — direct call by delegate)
+    ];
+
     try {
+      // Simulate first to avoid wasting gas on reverts
+      log("  Simulating MOR refill...");
+      await publicClient.simulateContract({
+        address: ALLOWANCE_MODULE,
+        abi: ALLOWANCE_MODULE_ABI,
+        functionName: "executeAllowanceTransfer",
+        args: morRefillArgs,
+        account: hotWallet,
+      });
+      log("  Simulation OK. Sending transaction...");
+
       const tx = await walletClient.writeContract({
         address: ALLOWANCE_MODULE,
         abi: ALLOWANCE_MODULE_ABI,
         functionName: "executeAllowanceTransfer",
-        args: [
-          SAFE_ADDRESS,      // safe
-          MOR_TOKEN,         // token
-          hotWallet,         // to
-          MOR_REFILL_AMOUNT, // amount (uint96)
-          zeroAddress,       // paymentToken (no gas payment)
-          0n,                // payment
-          hotWallet,         // delegate (msg.sender == delegate, no sig needed)
-          "0x",              // signature (empty — direct call by delegate)
-        ],
+        args: morRefillArgs,
       });
       log(`MOR refill tx: ${tx}`);
       const receipt = await publicClient.waitForTransactionReceipt({ hash: tx });
       log(`MOR refill: ${receipt.status === "success" ? "SUCCESS" : "REVERTED"}`);
+      if (receipt.status !== "success") {
+        await sendAlert(`MOR refill transaction reverted. Hot wallet may run out of MOR.`);
+      }
     } catch (e) {
-      log(`MOR refill failed: ${e.shortMessage || e.message}`);
+      const errMsg = e.shortMessage || e.message;
+      log(`MOR refill failed: ${errMsg}`);
+
+      // Check if this is a fundamental configuration issue
+      const isFundamentalFailure =
+        errMsg.includes("not a delegate") ||
+        errMsg.includes("module") ||
+        errMsg.includes("not enabled") ||
+        errMsg.includes("invalid delegate") ||
+        errMsg.includes("unauthorized");
+
+      if (isFundamentalFailure) {
+        log("FATAL: Fundamental configuration issue detected. Skipping ETH refill.");
+        await sendAlert(`CRITICAL: Refill configuration broken - ${errMsg}`, "critical");
+        log("Refill check complete (with errors).");
+        return; // Exit early, don't try ETH
+      }
+
+      // Only alert if it's not an expected "allowance exhausted" type error
+      if (!errMsg.includes("allowance") && !errMsg.includes("Allowance")) {
+        await sendAlert(`MOR refill failed: ${errMsg}. Hot wallet may run out of MOR.`);
+      }
     }
   } else {
     log("MOR balance OK.");
@@ -214,27 +351,60 @@ async function main() {
     log(
       `ETH below ${formatEther(ETH_LOW_THRESHOLD)} threshold. Pulling ${formatEther(ETH_REFILL_AMOUNT)} from Safe...`
     );
+
+    const ethRefillArgs = [
+      SAFE_ADDRESS,      // safe
+      zeroAddress,       // token (address(0) = native ETH)
+      hotWallet,         // to
+      ETH_REFILL_AMOUNT, // amount (uint96)
+      zeroAddress,       // paymentToken
+      0n,                // payment
+      hotWallet,         // delegate
+      "0x",              // signature
+    ];
+
     try {
+      // Simulate first to avoid wasting gas on reverts
+      log("  Simulating ETH refill...");
+      await publicClient.simulateContract({
+        address: ALLOWANCE_MODULE,
+        abi: ALLOWANCE_MODULE_ABI,
+        functionName: "executeAllowanceTransfer",
+        args: ethRefillArgs,
+        account: hotWallet,
+      });
+      log("  Simulation OK. Sending transaction...");
+
       const tx = await walletClient.writeContract({
         address: ALLOWANCE_MODULE,
         abi: ALLOWANCE_MODULE_ABI,
         functionName: "executeAllowanceTransfer",
-        args: [
-          SAFE_ADDRESS,      // safe
-          zeroAddress,       // token (address(0) = native ETH)
-          hotWallet,         // to
-          ETH_REFILL_AMOUNT, // amount (uint96)
-          zeroAddress,       // paymentToken
-          0n,                // payment
-          hotWallet,         // delegate
-          "0x",              // signature
-        ],
+        args: ethRefillArgs,
       });
       log(`ETH refill tx: ${tx}`);
       const receipt = await publicClient.waitForTransactionReceipt({ hash: tx });
       log(`ETH refill: ${receipt.status === "success" ? "SUCCESS" : "REVERTED"}`);
+      if (receipt.status !== "success") {
+        await sendAlert(`ETH refill transaction reverted. Hot wallet may run out of gas.`);
+      }
     } catch (e) {
-      log(`ETH refill failed: ${e.shortMessage || e.message}`);
+      const errMsg = e.shortMessage || e.message;
+      log(`ETH refill failed: ${errMsg}`);
+
+      // Check if this is a fundamental configuration issue
+      const isFundamentalFailure =
+        errMsg.includes("not a delegate") ||
+        errMsg.includes("module") ||
+        errMsg.includes("not enabled") ||
+        errMsg.includes("invalid delegate") ||
+        errMsg.includes("unauthorized");
+
+      if (isFundamentalFailure) {
+        await sendAlert(`CRITICAL: Refill configuration broken - ${errMsg}`, "critical");
+      } else if (!errMsg.includes("allowance") && !errMsg.includes("Allowance")) {
+        // Only alert if it's not an expected "allowance exhausted" type error
+        await sendAlert(`ETH refill failed: ${errMsg}. Hot wallet may run out of gas.`);
+      }
     }
   } else {
     log("ETH balance OK.");
@@ -243,7 +413,9 @@ async function main() {
   log("Refill check complete.");
 }
 
-main().catch((e) => {
-  log(`FATAL: ${e.message}`);
+main().catch(async (e) => {
+  const errMsg = e.message;
+  log(`FATAL: ${errMsg}`);
+  await sendAlert(`CRITICAL: Refill daemon crashed - ${errMsg}`, "critical");
   process.exit(1);
 });

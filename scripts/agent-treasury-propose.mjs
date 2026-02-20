@@ -77,8 +77,14 @@ loadEnv(`${SAFE_DIR}/.env`);
 
 // --- Configuration ---
 const SAFE_ADDRESS = process.env.SAFE_ADDRESS;
-const RPC_URL =
-  process.env.SAFE_RPC || process.env.EVERCLAW_RPC || "https://base-mainnet.public.blastapi.io";
+// SECURITY: Require explicit RPC config. Public RPCs can return manipulated data.
+const RPC_URL = process.env.SAFE_RPC || process.env.EVERCLAW_RPC;
+if (!RPC_URL) {
+  console.error("[ERROR] SAFE_RPC not configured in ~/morpheus/.env");
+  console.error("  Public RPCs are NOT secure for financial operations.");
+  console.error("  Use Alchemy, Infura, QuickNode, or your own node.");
+  process.exit(1);
+}
 
 // Safe Transaction Service for Base
 const TX_SERVICE_URL =
@@ -91,9 +97,7 @@ const KEYCHAIN_SERVICE =
 const KEYCHAIN_DB =
   process.env.SAFE_KEYCHAIN_DB || process.env.EVERCLAW_KEYCHAIN_DB ||
   `${process.env.HOME}/Library/Keychains/everclaw.keychain-db`;
-const KEYCHAIN_PASS_FILE =
-  process.env.SAFE_KEYCHAIN_PASS_FILE || process.env.EVERCLAW_KEYCHAIN_PASS_FILE ||
-  `${process.env.HOME}/.everclaw-keychain-pass`;
+// KEYCHAIN_PASS_FILE removed - auto-unlock via CLI args exposed password in `ps aux`
 
 // Contract addresses
 const MOR_TOKEN = "0x7431aDa8a591C955a994a21710752EF9b882b8e3";
@@ -124,16 +128,9 @@ function log(msg) {
 }
 
 function getPrivateKey() {
-  // Try to unlock keychain via password file (optional -- keychain may already be unlocked)
-  try {
-    const pass = readFileSync(KEYCHAIN_PASS_FILE, "utf-8").trim();
-    execFileSync("security", ["unlock-keychain", "-p", pass, KEYCHAIN_DB], {
-      stdio: "pipe",
-    });
-  } catch {
-    // Password file missing or unlock failed -- keychain may already be unlocked
-  }
-
+  // SECURITY: Keychain must be pre-unlocked. We no longer auto-unlock via password file
+  // because passing passwords via command-line args exposes them in `ps aux` output.
+  // Before running: security unlock-keychain ~/Library/Keychains/everclaw.keychain-db
   try {
     return execFileSync(
       "security",
@@ -148,7 +145,7 @@ function getPrivateKey() {
   } catch (e) {
     log(`ERROR: Could not retrieve wallet key from Keychain.`);
     log(`  Account: ${KEYCHAIN_ACCOUNT}, Service: ${KEYCHAIN_SERVICE}`);
-    log(`  Is the keychain unlocked? Run: security unlock-keychain ${KEYCHAIN_DB}`);
+    log(`  Unlock keychain first: security unlock-keychain "${KEYCHAIN_DB}"`);
     process.exit(1);
   }
 }
@@ -192,9 +189,21 @@ async function signSafeTxHash(account, safeTxHash) {
   const signature = await account.signMessage({
     message: { raw: toBytes(safeTxHash) },
   });
+
   // Adjust v for eth_sign (Safe expects v + 4)
+  // Normalize v to 27/28 first if it's in recovery id format (0/1)
   const sigBytes = toBytes(signature);
-  sigBytes[64] += 4;
+  let v = sigBytes[64];
+  if (v < 27) {
+    v += 27; // Normalize 0/1 -> 27/28
+  }
+  sigBytes[64] = v + 4; // Add 4 for eth_sign style -> 31/32
+
+  // Sanity check: v should now be 31 or 32
+  if (sigBytes[64] !== 31 && sigBytes[64] !== 32) {
+    throw new Error(`Unexpected signature v value after adjustment: ${sigBytes[64]} (original: ${v - (v >= 27 ? 0 : 27)})`);
+  }
+
   return toHex(sigBytes);
 }
 
@@ -275,12 +284,35 @@ async function cmdPropose(publicClient, account, safeAddress, targetArgs) {
   const to = getAddress(targetArgs.to);
   const value = targetArgs.value ? BigInt(targetArgs.value) : 0n;
   const data = targetArgs.data || "0x";
+
+  // SECURITY: Validate hex data format
+  if (data !== "0x" && !/^0x([0-9a-fA-F]{2})*$/.test(data)) {
+    log("ERROR: Invalid --data format. Must be '0x' followed by even number of hex characters.");
+    log("  Example: 0x or 0xa9059cbb000000...");
+    process.exit(1);
+  }
+
   const operation = targetArgs.operation || 0;
 
-  const [nonce, domainSeparator] = await Promise.all([
+  const [nonce, domainSeparator, pendingTxs] = await Promise.all([
     publicClient.readContract({ address: safeAddress, abi: SAFE_ABI, functionName: "nonce" }),
     publicClient.readContract({ address: safeAddress, abi: SAFE_ABI, functionName: "domainSeparator" }),
+    getPendingTransactions(safeAddress),
   ]);
+
+  // SECURITY: Check for nonce conflicts with pending transactions
+  const conflictingTx = pendingTxs.find(tx => BigInt(tx.nonce) === nonce);
+  if (conflictingTx) {
+    log(`ERROR: Pending transaction already exists at nonce ${nonce}:`);
+    log(`  Safe TX hash: ${conflictingTx.safeTxHash}`);
+    log(`  To: ${conflictingTx.to}`);
+    log(`  Value: ${formatEther(BigInt(conflictingTx.value))} ETH`);
+    log("");
+    log("Options:");
+    log("  1. Execute or reject the pending tx first");
+    log("  2. Use 'confirm --hash <safeTxHash>' to co-sign the existing tx");
+    process.exit(1);
+  }
 
   const txData = { to, value, data, operation, nonce };
   const safeTxHash = computeSafeTxHash(domainSeparator, txData);
@@ -305,6 +337,12 @@ async function cmdTransfer(publicClient, account, safeAddress, transferArgs) {
   const token = (transferArgs.token || "").toUpperCase();
   const to = getAddress(transferArgs.to);
   const amount = parseEther(transferArgs.amount);
+
+  // Validate amount is positive
+  if (amount <= 0n) {
+    log("ERROR: --amount must be greater than 0");
+    process.exit(1);
+  }
 
   let txTo, txValue, txData;
 
@@ -342,8 +380,8 @@ async function cmdThreshold(publicClient, account, safeAddress, thresholdArgs) {
     functionName: "getOwners",
   });
 
-  if (newThreshold < 1 || newThreshold > owners.length) {
-    log(`ERROR: Threshold must be between 1 and ${owners.length}`);
+  if (Number.isNaN(newThreshold) || newThreshold < 1 || newThreshold > owners.length) {
+    log(`ERROR: Threshold must be a number between 1 and ${owners.length}`);
     process.exit(1);
   }
 

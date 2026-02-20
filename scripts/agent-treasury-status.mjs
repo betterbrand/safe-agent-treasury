@@ -61,8 +61,14 @@ loadEnv(`${SAFE_DIR}/.env`);
 
 // --- Configuration ---
 const SAFE_ADDRESS = process.env.SAFE_ADDRESS;
-const RPC_URL =
-  process.env.SAFE_RPC || process.env.EVERCLAW_RPC || "https://base-mainnet.public.blastapi.io";
+// SECURITY: Require explicit RPC config. Public RPCs can return manipulated data.
+const RPC_URL = process.env.SAFE_RPC || process.env.EVERCLAW_RPC;
+if (!RPC_URL) {
+  console.error("[ERROR] SAFE_RPC not configured in ~/morpheus/.env");
+  console.error("  Public RPCs are NOT secure for financial operations.");
+  console.error("  Use Alchemy, Infura, QuickNode, or your own node.");
+  process.exit(1);
+}
 
 // Safe Transaction Service for Base
 const TX_SERVICE_URL =

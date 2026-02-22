@@ -220,8 +220,8 @@ All config lives in `~/morpheus/.env` (or the directory specified by `SAFE_DIR`)
 # Required
 SAFE_ADDRESS=0x...            # Safe wallet address on Base (set after deployment)
 
-# Optional -- RPC
-SAFE_RPC=https://...          # Base RPC URL (default: public BlastAPI)
+# Required -- RPC (no public fallback; see security note below)
+SAFE_RPC=https://...          # Base RPC URL (Alchemy, Infura, or QuickNode recommended)
 
 # Optional -- Keychain (defaults match existing everclaw setup)
 SAFE_KEYCHAIN_ACCOUNT=...    # Keychain account name
@@ -245,7 +245,7 @@ All `SAFE_*` env vars fall back to their `EVERCLAW_*` equivalents for backward c
 
 | Primary | Fallback | Default |
 |---------|----------|---------|
-| `SAFE_RPC` | `EVERCLAW_RPC` | `https://base-mainnet.public.blastapi.io` |
+| `SAFE_RPC` | `EVERCLAW_RPC` | *(required — no default)* |
 | `SAFE_KEYCHAIN_ACCOUNT` | `EVERCLAW_KEYCHAIN_ACCOUNT` | `everclaw-agent` |
 | `SAFE_KEYCHAIN_SERVICE` | `EVERCLAW_KEYCHAIN_SERVICE` | `everclaw-wallet-key` |
 | `SAFE_KEYCHAIN_DB` | `EVERCLAW_KEYCHAIN_DB` | `~/Library/Keychains/everclaw.keychain-db` |

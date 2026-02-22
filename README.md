@@ -39,7 +39,7 @@ Set in `~/morpheus/.env`:
 
 ```bash
 SAFE_ADDRESS=0x...       # Required: Safe address on Base
-SAFE_RPC=https://...     # Optional: Base RPC URL
+SAFE_RPC=https://...     # Required: Base RPC URL (Alchemy, Infura, or QuickNode recommended)
 ```
 
 See [SKILL.md](SKILL.md) for full configuration reference, deployment walkthrough, and architecture details.

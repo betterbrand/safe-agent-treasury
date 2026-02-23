@@ -46,6 +46,15 @@ chmod 700 "$SAFE_DIR/data/logs"
 cp "$SCRIPT_DIR/agent-treasury-refill.mjs" "$SAFE_DIR/agent-treasury-refill.mjs"
 chmod 700 "$SAFE_DIR/agent-treasury-refill.mjs"
 
+# Install runtime dependencies at the destination so the copied script can find them
+if [[ -f "$SKILL_DIR/package.json" ]]; then
+  cp "$SKILL_DIR/package.json" "$SAFE_DIR/package.json"
+  cp "$SKILL_DIR/package-lock.json" "$SAFE_DIR/package-lock.json" 2>/dev/null || true
+  (cd "$SAFE_DIR" && npm install --silent --omit=dev 2>/dev/null) || {
+    echo "   WARNING: npm install at $SAFE_DIR failed. Daemon may not start."
+  }
+fi
+
 # Secure .env if it exists (contains SAFE_ADDRESS, RPC credentials)
 if [[ -f "$SAFE_DIR/.env" ]]; then
   chmod 600 "$SAFE_DIR/.env"
@@ -56,7 +65,7 @@ if [[ -f "$SAFE_DIR/data/logs/refill.log" ]]; then
   chmod 600 "$SAFE_DIR/data/logs/refill.log"
 fi
 
-echo "   Copied agent-treasury-refill.mjs -> $SAFE_DIR/ (mode 700)"
+echo "   Copied agent-treasury-refill.mjs -> $SAFE_DIR/ (mode 700) with dependencies"
 
 # --- 3. Install launchd plist (macOS only) ---
 if [[ "$(uname)" == "Darwin" ]]; then

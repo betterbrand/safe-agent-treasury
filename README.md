@@ -1,4 +1,4 @@
-# Safe-Agent-Treasury for Smart Agent Neo
+# Safe-Agent-Treasury for truly Smart Agents
 
 Multi-sig treasury management for autonomous AI agents using [Safe Smart Account](https://safe.global) on Base.
 
